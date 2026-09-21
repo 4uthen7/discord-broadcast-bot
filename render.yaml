@@ -1,0 +1,16 @@
+# Render Blueprint: リポジトリのルートをこのフォルダ (bot.py がある場所) にするか、
+# rootDir を指定してください。
+services:
+  - type: web
+    name: discord-broadcast-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: ALLOWED_GUILD_IDS
+        sync: false
+
