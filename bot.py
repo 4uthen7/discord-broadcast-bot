@@ -35,6 +35,18 @@ ALLOWED_GUILD_IDS = {
 MAX_COUNT = max(1, int(os.environ.get("MAX_COUNT", "20")))
 PORT = int(os.environ["PORT"]) if os.environ.get("PORT", "").isdigit() else None
 
+# 実行を許可するユーザー / ロール (カンマ区切りの ID)。未設定ならサーバー管理系の権限だけで判定する。
+EXECUTOR_USER_IDS = {
+    int(value)
+    for value in os.environ.get("EXECUTOR_USER_IDS", "").replace(" ", "").split(",")
+    if value.isdigit()
+}
+EXECUTOR_ROLE_IDS = {
+    int(value)
+    for value in os.environ.get("EXECUTOR_ROLE_IDS", "").replace(" ", "").split(",")
+    if value.isdigit()
+}
+
 # 1 メッセージの上限は 2000 文字。安全マージンを取る。
 MAX_CONTENT_LEN = 1900
 MIN_MENTION_BUDGET = 25
@@ -211,6 +223,20 @@ def permission_report(interaction: discord.Interaction) -> tuple[str, str]:
         f"{label}={'あり' if ok else 'なし'}" for label, ok in checks
     )
     return info, "、".join(missing)
+
+
+def can_execute(interaction: discord.Interaction) -> bool:
+    """コマンドを実行してよいか。許可リストが設定されていればそちらも見る。"""
+    permissions = interaction.permissions
+    if permissions.manage_guild or permissions.administrator or permissions.mention_everyone:
+        return True
+
+    user = interaction.user
+    if user.id in EXECUTOR_USER_IDS:
+        return True
+
+    roles = getattr(user, "roles", ())
+    return any(role.id in EXECUTOR_ROLE_IDS for role in roles)
 
 
 @dataclass
@@ -644,6 +670,12 @@ SEND_STYLE_CHOICES = [
     app_commands.Choice(name="per_member (1 人ずつ別々に送信)", value="per_member"),
 ]
 
+# 許可リストを設定したときは、権限がなくても一覧に表示して実行可否はコード側で判定する
+if EXECUTOR_USER_IDS or EXECUTOR_ROLE_IDS:
+    command_permissions = app_commands.default_permissions()
+else:
+    command_permissions = app_commands.default_permissions(manage_guild=True)
+
 
 @bot.tree.command(
     name="broadcast",
@@ -663,7 +695,7 @@ SEND_STYLE_CHOICES = [
     dry_run="確認ボタンを出さずに内容だけ確認する",
 )
 @app_commands.choices(target=TARGET_CHOICES, send_style=SEND_STYLE_CHOICES)
-@app_commands.default_permissions(manage_guild=True)
+@command_permissions
 async def broadcast(
     interaction: discord.Interaction,
     message: str,
@@ -684,14 +716,10 @@ async def broadcast(
         )
         return
 
-    permissions = interaction.permissions
-    if not (
-        permissions.manage_guild
-        or permissions.administrator
-        or permissions.mention_everyone
-    ):
+    if not can_execute(interaction):
         await interaction.response.send_message(
-            "実行するにはサーバー管理またはメンション @everyone の権限が必要です。",
+            "実行権限がありません。サーバー管理・管理者・メンション @everyone のいずれか"
+            "(または許可リストに登録されたユーザー / ロール) が必要です。",
             ephemeral=True,
         )
         return
