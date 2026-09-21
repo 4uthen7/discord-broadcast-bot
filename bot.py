@@ -40,6 +40,7 @@ MAX_CONTENT_LEN = 1900
 MIN_MENTION_BUDGET = 25
 PREVIEW_LIMIT = 1850
 CONFIRM_TIMEOUT = 180
+MAX_INTERVAL = 3600.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,9 +51,14 @@ log = logging.getLogger("broadcast")
 MODE_LABELS = {
     "everyone": "@everyone",
     "here": "@here",
-    "members": "members (全員を個別メンション)",
+    "members": "members (メンバーを個別メンション)",
     "role": "role (ロールメンション)",
     "none": "none (メンションなし)",
+}
+
+SEND_STYLE_LABELS = {
+    "chunked": "chunked (1 メッセージにまとめて)",
+    "per_member": "per_member (1 人ずつ別々に送信)",
 }
 
 ALLOWED_MENTIONS = {
@@ -115,6 +121,75 @@ async def collect_members(
     return members
 
 
+class StopFlag:
+    """連続送信を途中で止めるためのフラグ。"""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+async def _sleep(seconds: float, stop: Optional[StopFlag] = None) -> None:
+    """停止要求に素早く反応できるよう、細かく分けて待機する。"""
+    remaining = float(seconds)
+    while remaining > 0:
+        if stop is not None and stop.stopped:
+            return
+        step = min(1.0, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+
+
+def resolve_members(
+    pool: Sequence[discord.Member],
+    raw: str,
+) -> tuple[list[discord.Member], list[str]]:
+    """ID / @メンション / ユーザー名 / 表示名 から対象メンバーを特定する。"""
+    by_id = {str(member.id): member for member in pool}
+    by_name: dict[str, discord.Member] = {}
+    for member in pool:
+        keys = (
+            member.name,
+            member.display_name,
+            f"{member.name}#{member.discriminator}",
+        )
+        for key in keys:
+            by_name.setdefault(key.casefold(), member)
+
+    tokens = [token.strip() for token in raw.replace("、", ",").replace("，", ",").split(",")]
+    tokens = [token for token in tokens if token]
+
+    if len(tokens) == 1:
+        whole = tokens[0].casefold()
+        if whole in by_name:
+            # 空白を含む表示名をそのまま書けるようにする
+            return [by_name[whole]], []
+
+    resolved: list[discord.Member] = []
+    unresolved: list[str] = []
+    for token in tokens:
+        member: Optional[discord.Member] = None
+        if token.startswith("<@") and token.endswith(">"):
+            member = by_id.get(token[2:-1].lstrip("!"))
+        if member is None:
+            member = by_id.get(token) or by_name.get(token.casefold())
+        if member is None:
+            unresolved.append(token)
+        elif member not in resolved:
+            resolved.append(member)
+    return resolved, unresolved
+
+
+def human_seconds(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f} 秒"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} 分"
+    return f"{seconds / 3600:.1f} 時間"
+
+
 @dataclass
 class BroadcastPlan:
     """送信内容の確定版。確認ボタンではこれを表示してから実行する。"""
@@ -131,6 +206,8 @@ class BroadcastPlan:
     allowed_mentions: discord.AllowedMentions
     target_info: str = ""
     mention_sample: str = ""
+    interval: float = 0.0
+    send_style: str = "chunked"
 
     def render(self) -> str:
         """確認用テキストを組み立てる (2000 文字を超えないよう本文を切り詰める)。"""
@@ -143,17 +220,22 @@ class BroadcastPlan:
         if self.target_info:
             header.append(self.target_info)
         header += [
+            f"送信方法: {SEND_STYLE_LABELS.get(self.send_style, self.send_style)}",
             f"送信回数: {self.count} 回",
             f"合計メッセージ数: {self.total_messages}",
-            f"送信間隔: {self.delay} 秒",
+            f"メッセージ間の待機: {self.delay} 秒",
         ]
+        if self.interval > 0 and self.count > 1:
+            header.append(f"回と回の間隔: {self.interval} 秒")
 
-        estimated = self.total_messages * self.delay
-        if estimated >= 600:
+        estimated = self.total_messages * self.delay + max(0, self.count - 1) * self.interval
+        if estimated >= 300:
             header.append(
-                f"⚠️ 推定所要時間: 約 {estimated / 60:.0f} 分"
+                f"⏱️ 推定所要時間: 約 {human_seconds(estimated)}"
                 " (長い処理のため、進捗表示が途中で止まる場合があります)"
             )
+        if self.total_messages >= 200:
+            header.append("⚠️ 送信数が多いため時間がかかります。送信中は「停止」で中断できます。")
 
         header += ["", "本文:"]
 
@@ -169,17 +251,34 @@ class BroadcastPlan:
         return "\n".join(header + [body] + footer)
 
 
+def progress_text(plan: BroadcastPlan, sent: int, round_index: int) -> str:
+    return (
+        f"⏳ 送信中… {sent}/{plan.total_messages} ({round_index}/{plan.count} 回目)"
+        " / 中断したいときは「停止」を押してください"
+    )
+
+
 async def run_plan(
     plan: BroadcastPlan,
     progress: Optional[Callable[[str], Awaitable[None]]] = None,
-) -> tuple[int, list[str], float]:
-    """plan を実行する。(送信数, エラー一覧, 所要秒) を返す。"""
+    stop: Optional[StopFlag] = None,
+) -> tuple[int, list[str], bool, float]:
+    """plan を実行する。(送信数, エラー一覧, 停止されたか, 所要秒) を返す。"""
     sent = 0
     errors: list[str] = []
+    stopped = False
     started = time.monotonic()
+    last_progress = started
 
     for round_index in range(1, plan.count + 1):
+        if stop is not None and stop.stopped:
+            stopped = True
+            break
+
         for payload in plan.payloads:
+            if stop is not None and stop.stopped:
+                stopped = True
+                break
             try:
                 await plan.channel.send(payload, allowed_mentions=plan.allowed_mentions)
             except discord.Forbidden:
@@ -188,23 +287,42 @@ async def run_plan(
             except discord.HTTPException as exc:
                 errors.append(f"送信に失敗しました: {exc.status} {exc.text}")
                 break
+
             sent += 1
-            if plan.delay > 0:
-                await asyncio.sleep(plan.delay)
+            await _sleep(plan.delay, stop)
 
-        if errors:
+            if progress is not None and time.monotonic() - last_progress >= 3.0:
+                last_progress = time.monotonic()
+                await progress(progress_text(plan, sent, round_index))
+
+        if errors or stopped:
             break
+
         if progress is not None:
-            await progress(
-                f"⏳ 送信中… {sent}/{plan.total_messages} ({round_index}/{plan.count} 回目)"
-            )
+            await progress(progress_text(plan, sent, round_index))
 
-    return sent, errors, time.monotonic() - started
+        if round_index < plan.count and plan.interval > 0:
+            await _sleep(plan.interval, stop)
+
+    return sent, errors, stopped, time.monotonic() - started
 
 
-def summary_text(plan: BroadcastPlan, sent: int, errors: list[str], elapsed: float) -> str:
+def summary_text(
+    plan: BroadcastPlan,
+    sent: int,
+    errors: list[str],
+    stopped: bool,
+    elapsed: float,
+) -> str:
+    if errors:
+        head = "⚠️ 途中で停止しました。"
+    elif stopped:
+        head = "⏹️ 停止しました (残りは送信していません)。"
+    else:
+        head = "✅ 送信が完了しました。"
+
     lines = [
-        "✅ 送信が完了しました。" if not errors else "⚠️ 途中で停止しました。",
+        head,
         f"メンション: {plan.mode_label} / 回数: {plan.count} 回",
         f"送信数: {sent}/{plan.total_messages}",
         f"送信先: {plan.channel_label}",
@@ -215,6 +333,29 @@ def summary_text(plan: BroadcastPlan, sent: int, errors: list[str], elapsed: flo
     if errors:
         lines.append("エラー: " + " / ".join(dict.fromkeys(errors)))
     return "\n".join(lines)
+
+
+class StopView(discord.ui.View):
+    """連続送信中に出す停止ボタン。"""
+
+    def __init__(self, flag: StopFlag, author_id: int) -> None:
+        super().__init__(timeout=None)
+        self.flag = flag
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "このボタンはコマンドを実行した本人だけが使えます。", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="停止", style=discord.ButtonStyle.secondary)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.flag.stop()
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
 
 
 class ConfirmView(discord.ui.View):
@@ -262,11 +403,21 @@ class ConfirmView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.disable_all()
         self.stop()  # 送信中のタイムアウト処理を止める (進捗表示の上書き防止)
-        await interaction.response.edit_message(view=self)
-        sent, errors, elapsed = await run_plan(
-            self.plan, progress=lambda text: self.edit_status(interaction, text)
+        flag = StopFlag()
+        await interaction.response.edit_message(view=StopView(flag, self.author_id))
+        sent, errors, stopped, elapsed = await run_plan(
+            self.plan,
+            progress=lambda text: self.edit_status(interaction, text),
+            stop=flag,
         )
-        await self.edit_status(interaction, summary_text(self.plan, sent, errors, elapsed))
+        try:
+            await interaction.edit_original_response(
+                content=summary_text(self.plan, sent, errors, stopped, elapsed),
+                view=None,
+                allowed_mentions=QUIET_MENTIONS,
+            )
+        except discord.HTTPException as exc:
+            log.warning("summary edit failed: %s", exc)
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -285,7 +436,10 @@ async def build_plan(
     role: Optional[discord.Role],
     filter_role: Optional[discord.Role],
     delay: float,
+    interval: float,
     include_bots: bool,
+    users: Optional[str],
+    send_style: str,
 ) -> tuple[Optional[BroadcastPlan], Optional[str]]:
     """(plan, エラーメッセージ) を返す。エラー時は plan が None。"""
     channel = interaction.channel
@@ -295,9 +449,21 @@ async def build_plan(
     if len(message) > MAX_CONTENT_LEN:
         return None, f"本文が長すぎます ({len(message)} 文字 / 上限 {MAX_CONTENT_LEN} 文字)。"
 
+    if users:
+        # users が指定されたときは個別メンションに切り替える
+        mode = "members"
+
+    if send_style == "per_member" and mode != "members":
+        return None, (
+            "send_style=per_member (1 人ずつ送信) は target=members か users と組み合わせてください。"
+        )
+
     channel_label = getattr(channel, "mention", str(channel))
     mode_label = MODE_LABELS[mode]
     mention_chunks: list[str] = []
+    member_list: list[discord.Member] = []
+    member_ids: list[int] = []
+    unresolved: list[str] = []
     target_info = ""
     mention_sample = ""
 
@@ -316,23 +482,48 @@ async def build_plan(
                 "target=members のときは本文を "
                 f"{MAX_CONTENT_LEN - MIN_MENTION_BUDGET} 文字以内にしてください。"
             )
-        members = await collect_members(interaction.guild, include_bots, filter_role)
-        if not members:
+        pool = await collect_members(interaction.guild, include_bots, filter_role)
+        if users:
+            pool, unresolved = resolve_members(pool, users)
+            if not pool:
+                return None, (
+                    "users で指定したメンバーが見つかりませんでした: " + ", ".join(unresolved)
+                )
+        if not pool:
             return None, "メンション対象のメンバーが見つかりませんでした。"
-        mention_chunks = chunk_mentions([member.id for member in members], message)
-        target_info = f"対象メンバー: {len(members)} 人 / 1 回あたり {len(mention_chunks)} メッセージ"
+
+        member_list = pool
+        member_ids = [member.id for member in pool]
+
+        notes: list[str] = []
+        if users:
+            notes.append("users で指定")
         if filter_role is not None:
-            target_info += f" (ロール {filter_role.name} のみ)"
-        sample = " ".join(member.mention for member in members[:5])
-        if len(members) > 5:
-            sample += f" … ほか {len(members) - 5} 人"
+            notes.append(f"ロール {filter_role.name} のみ")
+        target_info = f"対象メンバー: {len(member_ids)} 人"
+        if notes:
+            target_info += " (" + " / ".join(notes) + ")"
+
+        sample = " ".join(member.mention for member in member_list[:5])
+        if len(member_list) > 5:
+            sample += f" … ほか {len(member_list) - 5} 人"
         mention_sample = sample
 
-    payloads = (
-        [message]
-        if not mention_chunks
-        else [f"{chunk}\n{message}" for chunk in mention_chunks]
-    )
+    if send_style == "per_member":
+        payloads = [f"<@{user_id}>\n{message}" for user_id in member_ids]
+        target_info += f" / 1 回あたり {len(payloads)} メッセージ"
+    else:
+        if member_ids:
+            mention_chunks = chunk_mentions(member_ids, message)
+            target_info += f" / 1 回あたり {len(mention_chunks)} メッセージ"
+        payloads = (
+            [message]
+            if not mention_chunks
+            else [f"{chunk}\n{message}" for chunk in mention_chunks]
+        )
+
+    if unresolved:
+        target_info += f" / 未解決: {', '.join(unresolved)}"
 
     return (
         BroadcastPlan(
@@ -344,6 +535,8 @@ async def build_plan(
             payloads=payloads,
             count=count,
             delay=delay,
+            interval=interval,
+            send_style=send_style,
             total_messages=count * len(payloads),
             allowed_mentions=ALLOWED_MENTIONS[mode],
             target_info=target_info,
@@ -402,36 +595,47 @@ bot = BroadcastBot()
 TARGET_CHOICES = [
     app_commands.Choice(name="everyone (@everyone)", value="everyone"),
     app_commands.Choice(name="here (@here)", value="here"),
-    app_commands.Choice(name="members (全員を個別メンション)", value="members"),
+    app_commands.Choice(name="members (メンバーを個別メンション)", value="members"),
     app_commands.Choice(name="role (ロールメンション)", value="role"),
     app_commands.Choice(name="none (メンションなし)", value="none"),
+]
+
+SEND_STYLE_CHOICES = [
+    app_commands.Choice(name="chunked (1 メッセージにまとめて)", value="chunked"),
+    app_commands.Choice(name="per_member (1 人ずつ別々に送信)", value="per_member"),
 ]
 
 
 @bot.tree.command(
     name="broadcast",
-    description="カスタム文面を指定回数送信します (送信前に確認ボタンが出ます)",
+    description="メンション付きの文面を指定回数・指定間隔で送信します (確認ボタン付き)",
 )
 @app_commands.describe(
     message="送信する本文",
     count="送信する回数",
     target="メンションの対象",
+    users="個別にメンションする相手 (カンマ区切りの ID / @メンション / 名前)。指定すると個別メンションになります",
     role="target=role のときにメンションするロール",
     filter_role="target=members のときに、このロールを持つ人だけに送る",
-    delay="送信ごとの待機秒数 (レート制限対策)",
-    include_bots="target=members のときに Bot も含める",
+    send_style="members の送り方: まとめて / 1 人ずつ",
+    delay="1 メッセージごとの待機秒数 (レート制限対策)",
+    interval="回と回の間隔 (秒)。連続送信したいときに指定します",
+    include_bots="対象に Bot も含める",
     dry_run="確認ボタンを出さずに内容だけ確認する",
 )
-@app_commands.choices(target=TARGET_CHOICES)
+@app_commands.choices(target=TARGET_CHOICES, send_style=SEND_STYLE_CHOICES)
 @app_commands.default_permissions(manage_guild=True)
 async def broadcast(
     interaction: discord.Interaction,
     message: str,
     count: app_commands.Range[int, 1, MAX_COUNT] = 1,
     target: Optional[app_commands.Choice[str]] = None,
+    users: Optional[str] = None,
     role: Optional[discord.Role] = None,
     filter_role: Optional[discord.Role] = None,
+    send_style: Optional[app_commands.Choice[str]] = None,
     delay: app_commands.Range[float, 0.0, 30.0] = 1.5,
+    interval: app_commands.Range[float, 0.0, MAX_INTERVAL] = 0.0,
     include_bots: bool = False,
     dry_run: bool = False,
 ) -> None:
@@ -463,8 +667,19 @@ async def broadcast(
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     mode = target.value if target is not None else "everyone"
+    style = send_style.value if send_style is not None else "chunked"
     plan, error = await build_plan(
-        interaction, message, count, mode, role, filter_role, delay, include_bots
+        interaction,
+        message,
+        count,
+        mode,
+        role,
+        filter_role,
+        delay,
+        interval,
+        include_bots,
+        users,
+        style,
     )
     if plan is None:
         await interaction.followup.send(f"⚠️ {error}", ephemeral=True)
