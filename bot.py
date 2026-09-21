@@ -227,6 +227,12 @@ def permission_report(interaction: discord.Interaction) -> tuple[str, str]:
 
 def can_execute(interaction: discord.Interaction) -> bool:
     """コマンドを実行してよいか。許可リストが設定されていればそちらも見る。"""
+    guild = interaction.guild
+    if guild is None or guild.me is None:
+        # ユーザーインストール (Bot がサーバーにいない) は本人の権限で動くため、ここでは制限しない。
+        # 送信できるかどうかは実行時に Discord 側で判定される。
+        return True
+
     permissions = interaction.permissions
     if permissions.manage_guild or permissions.administrator or permissions.mention_everyone:
         return True
@@ -259,6 +265,11 @@ class BroadcastPlan:
     send_style: str = "chunked"
     permission_info: str = ""
     missing_perms: str = ""
+    webhook: Optional[discord.Webhook] = None
+
+    def sender(self):
+        """送信に使うオブジェクト。Bot がサーバーにいないときは Webhook 経由になる。"""
+        return self.webhook or self.channel
 
     def render(self) -> str:
         """確認用テキストを組み立てる (2000 文字を超えないよう本文を切り詰める)。"""
@@ -335,7 +346,7 @@ async def run_plan(
                 stopped = True
                 break
             try:
-                await plan.channel.send(payload, allowed_mentions=plan.allowed_mentions)
+                await plan.sender().send(payload, allowed_mentions=plan.allowed_mentions)
             except discord.Forbidden:
                 errors.append("送信権限がありません (チャンネル権限と Bot のロールを確認してください)")
                 break
@@ -521,6 +532,14 @@ async def build_plan(
             "send_style=per_member (1 人ずつ送信) は target=members か users と組み合わせてください。"
         )
 
+    is_member = interaction.guild is not None and interaction.guild.me is not None
+    if not is_member and mode in ("members",):
+        return None, (
+            "このアプリがサーバーに参加していない (ユーザーインストールの) 状態では、"
+            "メンバー一覧を取得できないため target=members は使えません。"
+            "everyone / here / none から選ぶか、Bot をサーバーに追加してください。"
+        )
+
     channel_label = getattr(channel, "mention", str(channel))
     mode_label = MODE_LABELS[mode]
     mention_chunks: list[str] = []
@@ -606,6 +625,7 @@ async def build_plan(
             mention_sample=mention_sample,
             permission_info=permission_info,
             missing_perms=missing_perms,
+            webhook=None if is_member else interaction.followup,
         ),
         None,
     )
@@ -695,6 +715,8 @@ else:
     dry_run="確認ボタンを出さずに内容だけ確認する",
 )
 @app_commands.choices(target=TARGET_CHOICES, send_style=SEND_STYLE_CHOICES)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @command_permissions
 async def broadcast(
     interaction: discord.Interaction,
