@@ -190,6 +190,29 @@ def human_seconds(seconds: float) -> str:
     return f"{seconds / 3600:.1f} 時間"
 
 
+def permission_report(interaction: discord.Interaction) -> tuple[str, str]:
+    """(Bot の権限の内訳, 不足している権限) を返す。判定できないときは ("", "")。"""
+    guild = interaction.guild
+    channel = interaction.channel
+    if guild is None or not isinstance(channel, discord.abc.GuildChannel):
+        return "", ""
+    me = guild.me
+    if me is None:
+        return "", ""
+
+    perms = channel.permissions_for(me)
+    checks = (
+        ("チャンネルを表示", perms.view_channel),
+        ("メッセージを送る", perms.send_messages),
+        ("全員宛にメンション", perms.mention_everyone),
+    )
+    missing = [label for label, ok in checks if not ok]
+    info = "Bot の権限: " + " / ".join(
+        f"{label}={'あり' if ok else 'なし'}" for label, ok in checks
+    )
+    return info, "、".join(missing)
+
+
 @dataclass
 class BroadcastPlan:
     """送信内容の確定版。確認ボタンではこれを表示してから実行する。"""
@@ -208,6 +231,8 @@ class BroadcastPlan:
     mention_sample: str = ""
     interval: float = 0.0
     send_style: str = "chunked"
+    permission_info: str = ""
+    missing_perms: str = ""
 
     def render(self) -> str:
         """確認用テキストを組み立てる (2000 文字を超えないよう本文を切り詰める)。"""
@@ -219,6 +244,10 @@ class BroadcastPlan:
         ]
         if self.target_info:
             header.append(self.target_info)
+        if self.missing_perms:
+            header.append(
+                f"⚠️ Bot に「{self.missing_perms}」の権限がありません。このままでは送信に失敗します。"
+            )
         header += [
             f"送信方法: {SEND_STYLE_LABELS.get(self.send_style, self.send_style)}",
             f"送信回数: {self.count} 回",
@@ -332,6 +361,12 @@ def summary_text(
         lines.append(plan.target_info)
     if errors:
         lines.append("エラー: " + " / ".join(dict.fromkeys(errors)))
+        if plan.permission_info:
+            lines.append(plan.permission_info)
+            lines.append(
+                "対処: サーバー設定 > ロール で Bot のロールに「メッセージを送る」を許可するか、"
+                "対象チャンネルの権限で Bot に許可してください。"
+            )
     return "\n".join(lines)
 
 
@@ -449,6 +484,8 @@ async def build_plan(
     if len(message) > MAX_CONTENT_LEN:
         return None, f"本文が長すぎます ({len(message)} 文字 / 上限 {MAX_CONTENT_LEN} 文字)。"
 
+    permission_info, missing_perms = permission_report(interaction)
+
     if users:
         # users が指定されたときは個別メンションに切り替える
         mode = "members"
@@ -541,6 +578,8 @@ async def build_plan(
             allowed_mentions=ALLOWED_MENTIONS[mode],
             target_info=target_info,
             mention_sample=mention_sample,
+            permission_info=permission_info,
+            missing_perms=missing_perms,
         ),
         None,
     )
